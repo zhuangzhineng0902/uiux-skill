@@ -1,0 +1,4 @@
+interface:
+  display_name: "UIUX 规范规则"
+  short_description: "检索 UI/UX 规则，并审查前端工程中的规范违规。"
+  default_prompt: "使用该 skill 根据组件清单获取相关 UI/UX 规则，或基于规则 CSV 审查前端工程。"
