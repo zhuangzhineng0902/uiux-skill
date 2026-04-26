@@ -20,7 +20,7 @@ description: 检索并应用本地 UI/UX 规范规则 CSV，用于 Web UI 开发
 当输入是组件清单时，运行：
 
 ```bash
-python3 skills/uiux-rules/scripts/uiux_rules.py \
+python3 scripts/uiux_rules.py \
   --rules-dir data \
   rules-for-components \
   --components "button,input,table"
@@ -39,7 +39,7 @@ python3 skills/uiux-rules/scripts/uiux_rules.py \
 当输入是前端代码工程时，运行：
 
 ```bash
-python3 skills/uiux-rules/scripts/uiux_rules.py \
+python3 scripts/uiux_rules.py \
   --rules-dir data \
   scan-project \
   --project /absolute/path/to/frontend
