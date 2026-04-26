@@ -17,9 +17,9 @@
 ├── SKILL.md                    # Skill 触发说明和使用流程
 ├── agents/openai.yaml          # Agent 展示名称、简介和默认提示词
 ├── data/
-│   ├── foundation-rules.csv    # 基础规范规则，当前 52 条
-│   ├── global-layout-rules.csv # 全局布局规则，当前 22 条
-│   └── component-rules.csv     # 组件规范规则，当前 29 条
+│   ├── foundation-rules.csv    # 基础规范规则，当前 20 条
+│   ├── global-layout-rules.csv # 全局布局规则，当前 88 条
+│   └── component-rules.csv     # 组件规范规则，当前 48 条
 ├── scripts/
 │   └── uiux_rules.py           # 规则检索与工程扫描脚本
 ├── example/                    # Vue 3 + Vite 示例工程
@@ -37,10 +37,10 @@
 组件规则当前覆盖：
 
 ```text
-button, input, select, table, toolbar
+button, collapse, datepicker, dropdown, form, input, link, select, table, toolbar
 ```
 
-全局规则中还包含表单、弹窗、Toast 等页面级或交互规则。
+全局规则中还包含通用布局、详情页、创建页、列表页、审批页等页面级或交互规则。
 
 ## 使用方式
 
