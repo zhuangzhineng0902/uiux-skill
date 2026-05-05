@@ -22,6 +22,8 @@ RULE_FILES = {
     "global": "global-layout-rules.csv",
 }
 
+COMPONENT_ALIASES_FILE = "component-aliases.csv"
+
 SCAN_EXTENSIONS = {
     ".css",
     ".scss",
@@ -162,6 +164,41 @@ SHORTHAND_EXPANSIONS = {
     "margin": ("margin-top", "margin-right", "margin-bottom", "margin-left"),
 }
 
+DEFAULT_COMPONENT_ALIASES = {
+    "el-button": "button",
+    "el-link": "link",
+    "el-table": "table",
+    "el-table-column": "table",
+    "el-form": "form",
+    "el-input": "input",
+    "el-input-number": "input",
+    "el-select": "select",
+    "el-date-picker": "datepicker",
+    "el-dropdown": "dropdown",
+    "el-collapse": "collapse",
+}
+
+INTERNAL_COMPONENT_PREFIXES = ("base", "biz", "corp", "ep", "pro", "u", "x")
+COMPONENT_NAME_HINTS = {
+    "button": ("button", "btn"),
+    "link": ("link",),
+    "table": ("table", "grid"),
+    "form": ("form",),
+    "input": ("input", "textarea"),
+    "select": ("select", "picker-select"),
+    "datepicker": ("date-picker", "datepicker", "date", "time-picker"),
+    "dropdown": ("dropdown", "menu"),
+    "collapse": ("collapse", "accordion"),
+}
+
+IGNORED_TEMPLATE_TAGS = {
+    "el-collapse-item",
+    "el-dropdown-item",
+    "el-form-item",
+    "el-option",
+    "option",
+}
+
 
 @dataclass(frozen=True)
 class Rule:
@@ -207,6 +244,16 @@ class Declaration:
     origin: str = "css"
 
 
+@dataclass(frozen=True)
+class ComponentUsage:
+    path: Path
+    line: int
+    tag: str
+    component: str
+    attrs: dict[str, str | bool]
+    context: str
+
+
 def resolve_rules_dir(value: str | None) -> Path:
     if value:
         return Path(value).expanduser().resolve()
@@ -231,6 +278,20 @@ def load_rules(rules_dir: Path) -> dict[str, list[Rule]]:
         with path.open(encoding="utf-8-sig", newline="") as handle:
             result[bucket] = [Rule(row) for row in csv.DictReader(handle)]
     return result
+
+
+def load_component_aliases(rules_dir: Path) -> dict[str, str]:
+    aliases = dict(DEFAULT_COMPONENT_ALIASES)
+    path = rules_dir / COMPONENT_ALIASES_FILE
+    if not path.exists():
+        return aliases
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            tag = normalize_component_tag(row.get("tag", ""))
+            component = row.get("component", "").strip().lower()
+            if tag and component:
+                aliases[tag] = component
+    return aliases
 
 
 def parse_components(raw_values: Iterable[str]) -> list[str]:
@@ -309,6 +370,105 @@ def iter_frontend_files(project: Path) -> Iterable[Path]:
         if any(part in IGNORED_DIRS for part in path.parts):
             continue
         yield path
+
+
+def extract_component_usages(path: Path, aliases: dict[str, str]) -> list[ComponentUsage]:
+    if path.suffix.lower() not in {".vue", ".svelte", ".html"}:
+        return []
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+
+    template_sources = extract_template_sources(path, text)
+    usages: list[ComponentUsage] = []
+    for source in template_sources:
+        usages.extend(parse_template_components(path, source["template"], source["line"], aliases))
+    return usages
+
+
+def extract_template_sources(path: Path, text: str) -> list[dict[str, object]]:
+    suffix = path.suffix.lower()
+    if suffix in {".vue", ".svelte"}:
+        sources: list[dict[str, object]] = []
+        for match in re.finditer(r"<template\b[^>]*>(?P<template>.*?)</template>", text, flags=re.IGNORECASE | re.DOTALL):
+            template = match.group("template")
+            if template.strip():
+                sources.append(
+                    {
+                        "template": template,
+                        "line": text[: match.start("template")].count("\n") + 1,
+                    }
+                )
+        return sources
+    return [{"template": text, "line": 1}]
+
+
+def parse_template_components(path: Path, template: str, start_line: int, aliases: dict[str, str]) -> list[ComponentUsage]:
+    usages: list[ComponentUsage] = []
+    tag_pattern = re.compile(r"<(?P<tag>[A-Za-z][\w.:-]*)(?P<attrs>(?:\s+[^<>]*?)?)(?:/?)>", flags=re.DOTALL)
+    for match in tag_pattern.finditer(template):
+        raw_tag = match.group("tag")
+        if raw_tag.startswith(("/", "!", "?")):
+            continue
+        tag = normalize_component_tag(raw_tag)
+        component = resolve_component_name(tag, aliases)
+        if not component:
+            continue
+        attrs = parse_template_attrs(match.group("attrs") or "")
+        line = start_line + template[: match.start()].count("\n")
+        context = f"<{raw_tag}{match.group('attrs') or ''}>"
+        usages.append(ComponentUsage(path, line, raw_tag, component, attrs, re.sub(r"\s+", " ", context).strip()))
+    return usages
+
+
+def normalize_component_tag(value: str) -> str:
+    value = value.strip()
+    value = re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", value)
+    return value.replace("_", "-").lower()
+
+
+def resolve_component_name(tag: str, aliases: dict[str, str]) -> str:
+    if tag in IGNORED_TEMPLATE_TAGS:
+        return ""
+    if tag in aliases:
+        return aliases[tag]
+    parts = [part for part in re.split(r"[-:.]", tag) if part]
+    if not parts:
+        return ""
+    for component, hints in COMPONENT_NAME_HINTS.items():
+        if tag == component or tag.endswith(f"-{component}") or any(hint in tag for hint in hints):
+            if len(parts) > 1 or parts[0] in INTERNAL_COMPONENT_PREFIXES:
+                return component
+    return ""
+
+
+def parse_template_attrs(raw: str) -> dict[str, str | bool]:
+    attrs: dict[str, str | bool] = {}
+    attr_pattern = re.compile(
+        r"(?P<name>[:@#]?[A-Za-z_][\w:.-]*)(?:\s*=\s*(?P<quote>['\"])(?P<quoted>.*?)\2|\s*=\s*(?P<bare>[^\s\"'=<>`]+))?",
+        flags=re.DOTALL,
+    )
+    for match in attr_pattern.finditer(raw):
+        name = normalize_attr_name(match.group("name"))
+        if not name:
+            continue
+        value = match.group("quoted") if match.group("quoted") is not None else match.group("bare")
+        attrs[name] = True if value is None else value.strip()
+    return attrs
+
+
+def normalize_attr_name(name: str) -> str:
+    name = name.strip()
+    if name.startswith("@") or name.startswith("#"):
+        return ""
+    if name.startswith(":"):
+        name = name[1:]
+    if name.startswith("v-bind:"):
+        name = name[len("v-bind:") :]
+    if "." in name:
+        name = name.split(".", 1)[0]
+    return to_kebab_case(name)
 
 
 def extract_declarations(path: Path) -> list[Declaration]:
@@ -612,10 +772,13 @@ def context_matches_state(rule: Rule, context: str) -> bool:
     return any(marker in lowered for marker in STATE_MARKERS.get(rule.state, (rule.state,)))
 
 
-def scan_project(project: Path, rules: dict[str, list[Rule]]) -> list[dict[str, object]]:
+def scan_project(project: Path, rules: dict[str, list[Rule]], component_aliases: dict[str, str] | None = None) -> list[dict[str, object]]:
     declarations: list[Declaration] = []
+    usages: list[ComponentUsage] = []
+    aliases = component_aliases or DEFAULT_COMPONENT_ALIASES
     for path in iter_frontend_files(project):
         declarations.extend(extract_declarations(path))
+        usages.extend(extract_component_usages(path, aliases))
 
     comparable_rules = [
         rule
@@ -661,6 +824,7 @@ def scan_project(project: Path, rules: dict[str, list[Rule]]) -> list[dict[str, 
                 }
             )
 
+    violations.extend(scan_component_usages(usages, rules["component"]))
     violations.extend(find_missing_component_states(declarations, rules["component"]))
     return dedupe_violations(violations)
 
@@ -791,6 +955,135 @@ def is_foundation_token_set_rule(rule: Rule) -> bool:
     return any(marker in subject_and_condition for marker in token_markers)
 
 
+def scan_component_usages(usages: list[ComponentUsage], component_rules: list[Rule]) -> list[dict[str, object]]:
+    rules_by_component: dict[str, list[Rule]] = {}
+    for rule in component_rules:
+        if rule.component:
+            rules_by_component.setdefault(rule.component, []).append(rule)
+
+    violations: list[dict[str, object]] = []
+    for usage in usages:
+        for rule in rules_by_component.get(usage.component, []):
+            violation = evaluate_component_rule(usage, rule)
+            if violation:
+                violations.append(violation)
+    return violations
+
+
+def evaluate_component_rule(usage: ComponentUsage, rule: Rule) -> dict[str, object] | None:
+    prop = rule.property_name
+    if prop == "size":
+        return require_prop_value(usage, rule, "size", rule.default_value or "default", report_missing=False)
+    if prop == "label-position":
+        if not is_primary_component_tag(usage):
+            return None
+        return require_prop_value(usage, rule, "label-position", rule.default_value or "top")
+    if prop == "fixed-position":
+        if has_action_column_marker(usage):
+            return require_prop_value(usage, rule, "fixed", "right")
+        return None
+    if prop == "component-config":
+        return evaluate_component_config_rule(usage, rule)
+    if prop == "white-space" and usage.tag.lower().endswith("table-column"):
+        if has_any_prop(usage, {"show-overflow-tooltip", "tooltip"}):
+            return None
+        return component_violation(usage, rule, "缺少防止表头换行的 tooltip/nowrap 配置", "未找到 show-overflow-tooltip")
+    if prop == "icon" and usage.component == "collapse":
+        if not is_primary_component_tag(usage):
+            return None
+        return require_prop_value(usage, rule, "expand-icon-position", rule.default_value or "left")
+    return None
+
+
+def evaluate_component_config_rule(usage: ComponentUsage, rule: Rule) -> dict[str, object] | None:
+    subject = rule.subject.lower()
+    if usage.component == "select":
+        if any(marker in subject for marker in ("清除", "clearable", "可清")) and not has_truthy_prop(usage, "clearable"):
+            return component_violation(usage, rule, "选择器缺少 clearable 配置", "未找到 clearable")
+        if any(marker in subject for marker in ("搜索", "searchable", "filterable")) and not has_any_prop(usage, {"filterable", "remote", "searchable"}):
+            return component_violation(usage, rule, "选择器缺少可搜索配置", "未找到 filterable/searchable")
+        if any(marker in subject for marker in ("折叠", "collapsed")) and is_multiple_select(usage) and not has_truthy_prop(usage, "collapse-tags"):
+            return component_violation(usage, rule, "多选选择器缺少标签折叠配置", "未找到 collapse-tags")
+    if usage.component == "datepicker":
+        if any(marker in subject for marker in ("清除", "clearable", "可清")) and not has_truthy_prop(usage, "clearable"):
+            return component_violation(usage, rule, "日期选择器缺少 clearable 配置", "未找到 clearable")
+    return None
+
+
+def require_prop_value(usage: ComponentUsage, rule: Rule, prop_name: str, expected: str, report_missing: bool = True) -> dict[str, object] | None:
+    actual = attr_value(usage, prop_name)
+    if actual is None:
+        if not report_missing:
+            return None
+        return component_violation(usage, rule, f"组件缺少 {prop_name} 配置", f"未找到 {prop_name}")
+    if normalize_template_value(actual) != normalize_template_value(expected):
+        return component_violation(usage, rule, f"组件 {prop_name} 配置不符合规范", str(actual))
+    return None
+
+
+def component_violation(usage: ComponentUsage, rule: Rule, reason: str, actual: str) -> dict[str, object]:
+    return {
+        "rule_id": rule.rule_id,
+        "layer": rule.layer,
+        "component": rule.component,
+        "state": rule.state,
+        "property_name": rule.property_name,
+        "expected": rule.default_value,
+        "actual": actual,
+        "path": str(usage.path),
+        "line": usage.line,
+        "reason": f"{reason}（{usage.tag} 识别为 {usage.component}）",
+        "condition_if": rule.row.get("condition_if", ""),
+        "preferred_pattern": rule.row.get("preferred_pattern", ""),
+        "anti_pattern": rule.row.get("anti_pattern", ""),
+    }
+
+
+def attr_value(usage: ComponentUsage, name: str) -> str | bool | None:
+    return usage.attrs.get(to_kebab_case(name))
+
+
+def has_truthy_prop(usage: ComponentUsage, name: str) -> bool:
+    value = attr_value(usage, name)
+    if value is None:
+        return False
+    if value is True:
+        return True
+    return normalize_template_value(value) not in {"false", "0", "undefined", "null"}
+
+
+def has_any_prop(usage: ComponentUsage, names: set[str]) -> bool:
+    return any(name in usage.attrs for name in names)
+
+
+def normalize_template_value(value: str | bool) -> str:
+    if value is True:
+        return "true"
+    normalized = str(value).strip().strip("'\"").lower()
+    return re.sub(r"\s+", " ", normalized)
+
+
+def is_multiple_select(usage: ComponentUsage) -> bool:
+    return has_truthy_prop(usage, "multiple") or normalize_template_value(attr_value(usage, "type") or "") == "multiple"
+
+
+def has_action_column_marker(usage: ComponentUsage) -> bool:
+    text = " ".join(str(value) for value in usage.attrs.values())
+    return bool(
+        usage.tag.lower().endswith("table-column")
+        and (
+            normalize_template_value(attr_value(usage, "type") or "") == "action"
+            or "操作" in text
+            or "action" in text.lower()
+        )
+    )
+
+
+def is_primary_component_tag(usage: ComponentUsage) -> bool:
+    tag = normalize_component_tag(usage.tag)
+    return tag not in IGNORED_TEMPLATE_TAGS and not tag.endswith(("-item", "-option"))
+
+
 def find_missing_component_states(declarations: list[Declaration], component_rules: list[Rule]) -> list[dict[str, object]]:
     required: dict[str, set[str]] = {}
     properties: dict[tuple[str, str], set[str]] = {}
@@ -885,6 +1178,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     rules_dir = resolve_rules_dir(args.rules_dir)
     rules = load_rules(rules_dir)
+    component_aliases = load_component_aliases(rules_dir)
 
     if args.command == "rules-for-components":
         selected = select_rules(rules, parse_components(args.components))
@@ -897,7 +1191,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "scan-project":
         project = Path(args.project).expanduser().resolve()
-        violations = scan_project(project, rules)
+        violations = scan_project(project, rules, component_aliases)
         if args.format == "json":
             print(json.dumps(violations, ensure_ascii=False, indent=2))
         else:

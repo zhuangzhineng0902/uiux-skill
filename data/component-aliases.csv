@@ -1,0 +1,33 @@
+tag,component,library,notes
+el-button,button,element-plus,Element Plus button
+el-link,link,element-plus,Element Plus link
+el-table,table,element-plus,Element Plus table
+el-table-column,table,element-plus,Element Plus table column
+el-form,form,element-plus,Element Plus form
+el-input,input,element-plus,Element Plus input
+el-input-number,input,element-plus,Element Plus input number
+el-select,select,element-plus,Element Plus select
+el-date-picker,datepicker,element-plus,Element Plus date picker
+el-dropdown,dropdown,element-plus,Element Plus dropdown
+el-collapse,collapse,element-plus,Element Plus collapse
+base-button,button,internal,示例内部组件别名，可替换为公司组件库真实标签
+base-table,table,internal,示例内部组件别名，可替换为公司组件库真实标签
+base-form,form,internal,示例内部组件别名，可替换为公司组件库真实标签
+base-input,input,internal,示例内部组件别名，可替换为公司组件库真实标签
+base-select,select,internal,示例内部组件别名，可替换为公司组件库真实标签
+base-date-picker,datepicker,internal,示例内部组件别名，可替换为公司组件库真实标签
+base-collapse,collapse,internal,示例内部组件别名，可替换为公司组件库真实标签
+pro-button,button,internal,示例内部组件别名，可替换为公司组件库真实标签
+pro-table,table,internal,示例内部组件别名，可替换为公司组件库真实标签
+pro-form,form,internal,示例内部组件别名，可替换为公司组件库真实标签
+pro-input,input,internal,示例内部组件别名，可替换为公司组件库真实标签
+pro-select,select,internal,示例内部组件别名，可替换为公司组件库真实标签
+pro-date-picker,datepicker,internal,示例内部组件别名，可替换为公司组件库真实标签
+pro-collapse,collapse,internal,示例内部组件别名，可替换为公司组件库真实标签
+x-button,button,internal,示例内部组件别名，可替换为公司组件库真实标签
+x-table,table,internal,示例内部组件别名，可替换为公司组件库真实标签
+x-form,form,internal,示例内部组件别名，可替换为公司组件库真实标签
+x-input,input,internal,示例内部组件别名，可替换为公司组件库真实标签
+x-select,select,internal,示例内部组件别名，可替换为公司组件库真实标签
+x-date-picker,datepicker,internal,示例内部组件别名，可替换为公司组件库真实标签
+x-collapse,collapse,internal,示例内部组件别名，可替换为公司组件库真实标签

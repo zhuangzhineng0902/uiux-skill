@@ -19,7 +19,8 @@
 ├── data/
 │   ├── foundation-rules.csv    # 基础规范规则，当前 20 条
 │   ├── global-layout-rules.csv # 全局布局规则，当前 88 条
-│   └── component-rules.csv     # 组件规范规则，当前 48 条
+│   ├── component-rules.csv     # 组件规范规则，当前 48 条
+│   └── component-aliases.csv   # Vue 组件标签到规范组件类型的映射
 ├── scripts/
 │   └── uiux_rules.py           # 规则检索与工程扫描脚本
 ├── example/                    # Vue 3 + Vite 示例工程
@@ -102,6 +103,19 @@ python3 scripts/uiux_rules.py \
 ```
 
 扫描器会展开 `padding`、`margin`、`border` 等常见简写属性，并对基础规范、全局布局规范和组件状态规范做静态比较。
+
+## 组件识别
+
+模板扫描会读取 `data/component-aliases.csv`，将公司内部 Vue 组件标签映射到规范组件类型，例如：
+
+```csv
+tag,component,library,notes
+x-button,button,internal,公司按钮组件
+x-table,table,internal,公司表格组件
+x-date-picker,datepicker,internal,公司日期选择器
+```
+
+脚本已内置 Element Plus 常用组件映射，并会跳过 `el-form-item`、`el-option`、`el-collapse-item` 等子组件，避免把子组件误判成主组件。
 
 ## 输出说明
 
