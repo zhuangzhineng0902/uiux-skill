@@ -22,7 +22,8 @@
 │   ├── component-rules.csv     # 组件规范规则，当前 48 条
 │   └── component-aliases.csv   # Vue 组件标签到规范组件类型的映射
 ├── scripts/
-│   └── uiux_rules.py           # 规则检索与工程扫描脚本
+│   ├── uiux_rules.py           # 规则检索与工程扫描脚本
+│   └── extract_ast_components.js # Vue/JSX/TSX 组件 AST 抽取器
 ├── example/                    # Vue 3 + Vite 示例工程
 └── 需求样例全.md                # 详情页需求样例
 ```
@@ -104,9 +105,17 @@ python3 scripts/uiux_rules.py \
 
 扫描器会展开 `padding`、`margin`、`border` 等常见简写属性，并对基础规范、全局布局规范和组件状态规范做静态比较。
 
+CSS 扫描优先使用 `tinycss2` 解析样式规则；组件扫描优先使用 AST：
+
+- `.vue`：通过 `@vue/compiler-sfc` 读取 SFC，再用 `@vue/compiler-dom` 解析 `<template>`。
+- `.html` / `.svelte`：通过 `@vue/compiler-dom` 解析模板结构。
+- `.jsx` / `.tsx` / `.js` / `.ts`：通过 `@babel/parser` 解析 JSX 组件调用。
+
+若本机没有安装对应 Node 依赖，脚本会自动回退到轻量模板扫描，不中断基础扫描流程。
+
 ## 组件识别
 
-模板扫描会读取 `data/component-aliases.csv`，将公司内部 Vue 组件标签映射到规范组件类型，例如：
+组件扫描会读取 `data/component-aliases.csv`，将公司内部 Vue/JSX 组件标签映射到规范组件类型，例如：
 
 ```csv
 tag,component,library,notes
@@ -116,6 +125,8 @@ x-date-picker,datepicker,internal,公司日期选择器
 ```
 
 脚本已内置 Element Plus 常用组件映射，并会跳过 `el-form-item`、`el-option`、`el-collapse-item` 等子组件，避免把子组件误判成主组件。
+
+动态绑定属性会被标记为未知表达式。对于无法静态证明的值，扫描器会降低置信度并跳过字面值违规判断，避免把 `:size="computedSize"`、`:clearable="isClearable"` 这类运行时配置误报为不符合规范。
 
 ## 输出说明
 

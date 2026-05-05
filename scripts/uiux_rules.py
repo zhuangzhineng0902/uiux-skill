@@ -518,6 +518,7 @@ def parse_template_components(path: Path, template: str, start_line: int, aliase
 
 def normalize_component_tag(value: str) -> str:
     value = value.strip()
+    value = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1-\2", value)
     value = re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", value)
     return value.replace("_", "-").lower()
 

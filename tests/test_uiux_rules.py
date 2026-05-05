@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -21,6 +22,19 @@ def load_module():
 
 
 uiux = load_module()
+
+
+def ast_dependencies_available() -> bool:
+    command = [
+        "node",
+        "-e",
+        "for (const p of ['@vue/compiler-sfc','@vue/compiler-dom','@babel/parser']) "
+        "{ require.resolve(p, {paths: [process.cwd(), process.cwd() + '/example']}); }",
+    ]
+    try:
+        return subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=5).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def component_rule(rule_id: str, component: str, property_name: str, default_value: str = "", subject: str = ""):
@@ -188,6 +202,66 @@ class ComponentRecognitionTests(unittest.TestCase):
             any(item["rule_id"] == "CMP-009" and "未找到 size" in item["actual"] for item in violations),
             "missing size should not be reported because global defaults may supply default size",
         )
+
+    @unittest.skipUnless(ast_dependencies_available(), "AST dependencies are not installed")
+    def test_vue_ast_scanner_ignores_unknown_dynamic_bound_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "Page.vue").write_text(
+                """
+<script setup>
+const computedSize = getSize()
+</script>
+<template>
+  <x-input :size="computedSize" />
+  <x-select :clearable="isClearable" />
+</template>
+""",
+                encoding="utf-8",
+            )
+
+            rules = {
+                "foundation": [],
+                "global": [],
+                "component": [
+                    component_rule("CMP-009", "input", "size", "default", "input size"),
+                    component_rule("CMP-011", "select", "component-config", "", "配置可清除"),
+                ],
+            }
+            aliases = {"x-input": "input", "x-select": "select"}
+
+            violations = uiux.scan_project(project, rules, aliases)
+
+        self.assertFalse(violations, "unknown dynamic bindings should not produce high-confidence violations")
+
+    @unittest.skipUnless(ast_dependencies_available(), "AST dependencies are not installed")
+    def test_tsx_ast_scanner_recognizes_internal_components(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "Page.tsx").write_text(
+                """
+export function Page() {
+  return <section><XInput size="small" /><XSelect /></section>
+}
+""",
+                encoding="utf-8",
+            )
+
+            rules = {
+                "foundation": [],
+                "global": [],
+                "component": [
+                    component_rule("CMP-009", "input", "size", "default", "input size"),
+                    component_rule("CMP-011", "select", "component-config", "", "配置可清除"),
+                ],
+            }
+            aliases = {"x-input": "input", "x-select": "select"}
+
+            violations = uiux.scan_project(project, rules, aliases)
+
+        by_rule = {item["rule_id"]: item for item in violations}
+        self.assertEqual(by_rule["CMP-009"]["actual"], "small")
+        self.assertIn("CMP-011", by_rule)
 
 
 if __name__ == "__main__":
