@@ -10,6 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+try:
+    import tinycss2
+except ImportError:  # pragma: no cover - optional dependency, fallback parser is used.
+    tinycss2 = None
+
 
 RULE_FILES = {
     "foundation": "foundation-rules.csv",
@@ -69,6 +74,9 @@ SPACING_PROPS = {
     "margin-right",
     "margin-bottom",
     "margin-left",
+}
+
+POSITION_PROPS = {
     "top",
     "right",
     "bottom",
@@ -196,6 +204,7 @@ class Declaration:
     value: str
     context: str
     source_prop: str = ""
+    origin: str = "css"
 
 
 def resolve_rules_dir(value: str | None) -> Path:
@@ -304,45 +313,152 @@ def iter_frontend_files(project: Path) -> Iterable[Path]:
 
 def extract_declarations(path: Path) -> list[Declaration]:
     try:
-        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return []
 
     declarations: list[Declaration] = []
-    selector_stack: list[str] = []
-    for index, line in enumerate(lines, start=1):
-        stripped = line.strip()
-        if "{" in stripped:
-            before = stripped.split("{", 1)[0].strip()
-            if before.startswith("@media"):
-                selector_stack.append(before)
-            elif before and not before.startswith(("@", "if ", "for ", "function ")):
-                selector_stack.append(before)
-        context = " ".join(selector_stack[-3:]) + " " + stripped
-
-        for match in re.finditer(r"(?P<prop>[-a-zA-Z]+)\s*:\s*(?P<value>[^;,{}`]+)", stripped):
-            prop = to_kebab_case(match.group("prop"))
-            value = clean_value(match.group("value"))
-            if prop and value:
-                declarations.extend(expand_declaration(path, index, prop, value, context.strip()))
-
-        closing_count = stripped.count("}")
-        for _ in range(min(closing_count, len(selector_stack))):
-            selector_stack.pop()
+    for source in extract_style_sources(path, text):
+        declarations.extend(parse_css_declarations(path, source["css"], source["line"], source["context"]))
     return declarations
 
 
-def expand_declaration(path: Path, line: int, prop: str, value: str, context: str) -> list[Declaration]:
+def extract_style_sources(path: Path, text: str) -> list[dict[str, object]]:
+    suffix = path.suffix.lower()
+    if suffix in {".vue", ".svelte", ".html"}:
+        sources: list[dict[str, object]] = []
+        for match in re.finditer(r"<style\b(?P<attrs>[^>]*)>(?P<css>.*?)</style>", text, flags=re.IGNORECASE | re.DOTALL):
+            css = match.group("css")
+            if not css.strip():
+                continue
+            line = text[: match.start("css")].count("\n") + 1
+            attrs = re.sub(r"\s+", " ", match.group("attrs").strip())
+            sources.append({"css": css, "line": line, "context": f"<style {attrs}>".strip()})
+        return sources
+    return [{"css": text, "line": 1, "context": path.name}]
+
+
+def parse_css_declarations(path: Path, css: str, start_line: int, source_context: str) -> list[Declaration]:
+    if tinycss2 is not None:
+        try:
+            rules = tinycss2.parse_stylesheet(css, skip_comments=True, skip_whitespace=True)
+            return parse_tinycss_rules(path, rules, start_line, [source_context])
+        except Exception:
+            pass
+    return parse_css_declarations_fallback(path, css, start_line, source_context)
+
+
+def parse_tinycss_rules(path: Path, rules: list[object], start_line: int, context_stack: list[str]) -> list[Declaration]:
+    declarations: list[Declaration] = []
+    for rule in rules:
+        rule_type = getattr(rule, "type", "")
+        if rule_type == "qualified-rule":
+            selector = tinycss2.serialize(rule.prelude).strip()
+            context = " ".join(part for part in [*context_stack, selector] if part)
+            for declaration in tinycss2.parse_declaration_list(rule.content, skip_comments=True, skip_whitespace=True):
+                if getattr(declaration, "type", "") != "declaration":
+                    continue
+                prop = to_kebab_case(declaration.name)
+                value = clean_value(tinycss2.serialize(declaration.value))
+                if prop and value:
+                    line = start_line + max(getattr(declaration, "source_line", 1) - 1, 0)
+                    declarations.extend(expand_declaration(path, line, prop, value, context, origin="tinycss2"))
+        elif rule_type == "at-rule" and getattr(rule, "content", None):
+            at_context = f"@{rule.lower_at_keyword} {tinycss2.serialize(rule.prelude).strip()}".strip()
+            nested = tinycss2.parse_rule_list(rule.content, skip_comments=True, skip_whitespace=True)
+            declarations.extend(parse_tinycss_rules(path, nested, start_line, [*context_stack, at_context]))
+    return declarations
+
+
+def parse_css_declarations_fallback(path: Path, css: str, start_line: int, source_context: str) -> list[Declaration]:
+    declarations: list[Declaration] = []
+    for selector, body, line in iter_css_blocks(css, start_line):
+        context = f"{source_context} {selector}".strip()
+        declarations.extend(parse_declaration_block(path, body, line, context))
+    return declarations
+
+
+def iter_css_blocks(css: str, start_line: int) -> Iterable[tuple[str, str, int]]:
+    stack: list[tuple[str, int]] = []
+    token_start = 0
+    index = 0
+    while index < len(css):
+        char = css[index]
+        if char in {"'", '"'}:
+            index = skip_css_string(css, index)
+            continue
+        if css.startswith("/*", index):
+            index = css.find("*/", index + 2)
+            if index == -1:
+                break
+            index += 2
+            continue
+        if char == "{":
+            selector = css[token_start:index].strip()
+            stack.append((selector, index + 1))
+            token_start = index + 1
+        elif char == "}" and stack:
+            selector, body_start = stack.pop()
+            body = css[body_start:index]
+            line = start_line + css[:body_start].count("\n")
+            if selector and ":" in body and not selector.lstrip().startswith("@"):
+                yield selector, body, line
+            token_start = index + 1
+        index += 1
+
+
+def skip_css_string(css: str, index: int) -> int:
+    quote = css[index]
+    index += 1
+    while index < len(css):
+        if css[index] == "\\":
+            index += 2
+            continue
+        if css[index] == quote:
+            return index + 1
+        index += 1
+    return index
+
+
+def parse_declaration_block(path: Path, body: str, start_line: int, context: str) -> list[Declaration]:
+    declarations: list[Declaration] = []
+    chunk_start = 0
+    depth = 0
+    index = 0
+    while index <= len(body):
+        char = body[index] if index < len(body) else ";"
+        if char in {"'", '"'}:
+            index = skip_css_string(body, index)
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")" and depth:
+            depth -= 1
+        elif char == ";" and depth == 0:
+            chunk = body[chunk_start:index].strip()
+            if ":" in chunk:
+                prop, value = chunk.split(":", 1)
+                prop = to_kebab_case(prop)
+                value = clean_value(value)
+                line = start_line + body[:chunk_start].count("\n")
+                if prop and value:
+                    declarations.extend(expand_declaration(path, line, prop, value, context, origin="fallback-css"))
+            chunk_start = index + 1
+        index += 1
+    return declarations
+
+
+def expand_declaration(path: Path, line: int, prop: str, value: str, context: str, origin: str = "css") -> list[Declaration]:
     if prop in SHORTHAND_EXPANSIONS:
         values = split_box_values(value)
         expanded = dict(zip(SHORTHAND_EXPANSIONS[prop], values, strict=True))
         return [
-            Declaration(path, line, expanded_prop, expanded_value, context, source_prop=prop)
+            Declaration(path, line, expanded_prop, expanded_value, context, source_prop=prop, origin=origin)
             for expanded_prop, expanded_value in expanded.items()
         ]
     if prop == "border":
-        return expand_border(path, line, value, context)
-    return [Declaration(path, line, prop, value, context, source_prop=prop)]
+        return expand_border(path, line, value, context, origin=origin)
+    return [Declaration(path, line, prop, value, context, source_prop=prop, origin=origin)]
 
 
 def split_box_values(value: str) -> tuple[str, str, str, str]:
@@ -361,7 +477,7 @@ def split_box_values(value: str) -> tuple[str, str, str, str]:
     return top, right, bottom, left
 
 
-def expand_border(path: Path, line: int, value: str, context: str) -> list[Declaration]:
+def expand_border(path: Path, line: int, value: str, context: str, origin: str = "css") -> list[Declaration]:
     width = ""
     style = ""
     color = ""
@@ -374,12 +490,12 @@ def expand_border(path: Path, line: int, value: str, context: str) -> list[Decla
             color = part
     declarations = []
     if width:
-        declarations.append(Declaration(path, line, "border-width", width, context, source_prop="border"))
+        declarations.append(Declaration(path, line, "border-width", width, context, source_prop="border", origin=origin))
     if style:
-        declarations.append(Declaration(path, line, "border-style", style, context, source_prop="border"))
+        declarations.append(Declaration(path, line, "border-style", style, context, source_prop="border", origin=origin))
     if color:
-        declarations.append(Declaration(path, line, "border-color", color, context, source_prop="border"))
-    return declarations or [Declaration(path, line, "border", value, context, source_prop="border")]
+        declarations.append(Declaration(path, line, "border-color", color, context, source_prop="border", origin=origin))
+    return declarations or [Declaration(path, line, "border", value, context, source_prop="border", origin=origin)]
 
 
 def clean_value(value: str) -> str:
@@ -402,13 +518,45 @@ def normalize_css_value(value: str) -> str:
 
 
 def expected_values(rule: Rule) -> list[str]:
-    raw = rule.default_value
-    if not raw:
-        return []
-    if not looks_like_css_value(raw):
-        return []
-    parts = [part.strip() for part in re.split(r"[、|/，]", raw) if part.strip()]
-    return parts or [raw]
+    raw_values = [rule.default_value]
+    if rule.property_name in {"spacing", "font-size", "typography-token", "border-radius", "box-shadow", "color", "background-color"}:
+        raw_values.extend(
+            [
+                rule.row.get("then_clause", ""),
+                rule.row.get("preferred_pattern", ""),
+            ]
+        )
+
+    result: list[str] = []
+    for raw in raw_values:
+        if not raw:
+            continue
+        parts = [part.strip() for part in re.split(r"[、|/，]", raw) if part.strip()]
+        candidates = parts if any(looks_like_css_value(part) for part in parts) else [raw]
+        for candidate in candidates:
+            if looks_like_css_value(candidate) and candidate not in result:
+                result.append(candidate)
+        for value in extract_css_literals(raw):
+            if value not in result:
+                result.append(value)
+    return result
+
+
+def extract_css_literals(value: str) -> list[str]:
+    literals: list[str] = []
+    patterns = [
+        r"#[0-9a-fA-F]{3,8}\b",
+        r"rgba?\([^)]*\)",
+        r"hsla?\([^)]*\)",
+        r"\b\d+(\.\d+)?(px|rem|em|%|vh|vw|s|ms)\b",
+        r"\b0\b",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, value):
+            literal = match.group(0)
+            if literal not in literals:
+                literals.append(literal)
+    return literals
 
 
 def looks_like_css_value(value: str) -> bool:
@@ -487,11 +635,13 @@ def scan_project(project: Path, rules: dict[str, list[Rule]]) -> list[dict[str, 
                 continue
             expected = [normalize_css_value(value) for value in expected_values(rule)]
             actual = normalize_css_value(declaration.value)
-            if actual in expected:
+            if css_value_matches(actual, expected):
                 continue
             if rule.layer == "foundation" and not foundation_context_matches(rule, declaration):
                 continue
             if rule.layer == "global" and not global_context_matches(rule, declaration.context):
+                continue
+            if is_low_confidence_css_comparison(rule, declaration):
                 continue
             violations.append(
                 {
@@ -523,6 +673,48 @@ def is_comparable_rule(rule: Rule) -> bool:
     if rule.layer == "foundation" and not rule_css_properties(rule):
         return False
     return True
+
+
+def is_low_confidence_css_comparison(rule: Rule, declaration: Declaration) -> bool:
+    actual = normalize_css_value(declaration.value)
+    if rule.property_name == "spacing":
+        if actual in {"0", "0px", "0rem", "0em", "auto"}:
+            return True
+        if "calc(" in actual or actual.startswith("-"):
+            return True
+        if declaration.prop in POSITION_PROPS:
+            return True
+        if is_reset_context(declaration.context):
+            return True
+    if rule.layer == "foundation" and rule.property_name in {"spacing", "font-size", "typography-token"}:
+        if is_reset_context(declaration.context):
+            return True
+    return False
+
+
+def css_value_matches(actual: str, expected: list[str]) -> bool:
+    if actual in expected:
+        return True
+    actual_px = css_length_to_px(actual)
+    if actual_px is None:
+        return False
+    return any(expected_px is not None and abs(actual_px - expected_px) < 0.01 for expected_px in map(css_length_to_px, expected))
+
+
+def css_length_to_px(value: str) -> float | None:
+    match = re.fullmatch(r"(-?\d+(?:\.\d+)?)(px|rem)", normalize_css_value(value))
+    if not match:
+        return None
+    number = float(match.group(1))
+    unit = match.group(2)
+    return number if unit == "px" else number * 16
+
+
+def is_reset_context(context: str) -> bool:
+    lowered = context.lower()
+    reset_selectors = ("*", "::before", "::after", "body", "html", "#app")
+    reset_markers = ("reset", "normalize", "base.css", "main.css")
+    return any(selector in lowered for selector in reset_selectors) and any(marker in lowered for marker in reset_markers)
 
 
 def global_context_matches(rule: Rule, context: str) -> bool:
