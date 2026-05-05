@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,8 @@ RULE_FILES = {
 }
 
 COMPONENT_ALIASES_FILE = "component-aliases.csv"
+AST_COMPONENT_EXTRACTOR = Path(__file__).with_name("extract_ast_components.js")
+DYNAMIC_ATTR_PREFIX = "__dynamic__:"
 
 SCAN_EXTENSIONS = {
     ".css",
@@ -373,6 +376,97 @@ def iter_frontend_files(project: Path) -> Iterable[Path]:
 
 
 def extract_component_usages(path: Path, aliases: dict[str, str]) -> list[ComponentUsage]:
+    usages = extract_component_usages_from_files([path], aliases)
+    if usages:
+        return usages
+    return extract_component_usages_fallback(path, aliases)
+
+
+def extract_component_usages_from_files(paths: Iterable[Path], aliases: dict[str, str]) -> list[ComponentUsage]:
+    candidates = [
+        path
+        for path in paths
+        if path.suffix.lower() in {".vue", ".svelte", ".html", ".jsx", ".tsx", ".js", ".ts"}
+    ]
+    if not candidates:
+        return []
+    usages = extract_component_usages_ast(candidates, aliases)
+    if usages is not None:
+        return usages
+    fallback_usages: list[ComponentUsage] = []
+    for path in candidates:
+        fallback_usages.extend(extract_component_usages_fallback(path, aliases))
+    return fallback_usages
+
+
+def extract_component_usages_ast(paths: list[Path], aliases: dict[str, str]) -> list[ComponentUsage] | None:
+    if not AST_COMPONENT_EXTRACTOR.exists():
+        return None
+    payload = {"files": [str(path) for path in paths]}
+    try:
+        completed = subprocess.run(
+            ["node", str(AST_COMPONENT_EXTRACTOR)],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            cwd=str(Path(__file__).resolve().parents[1]),
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    try:
+        items = json.loads(completed.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    return component_usages_from_ast_items(items, aliases)
+
+
+def component_usages_from_ast_items(items: list[object], aliases: dict[str, str]) -> list[ComponentUsage]:
+    usages: list[ComponentUsage] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        raw_tag = str(item.get("tag", "")).strip()
+        tag = normalize_component_tag(raw_tag)
+        component = resolve_component_name(tag, aliases)
+        if not component:
+            continue
+        raw_attrs = item.get("attrs", {})
+        attrs = normalize_ast_attrs(raw_attrs if isinstance(raw_attrs, dict) else {})
+        usages.append(
+            ComponentUsage(
+                Path(str(item.get("path", ""))),
+                int(item.get("line") or 1),
+                raw_tag,
+                component,
+                attrs,
+                re.sub(r"\s+", " ", str(item.get("context", ""))).strip(),
+            )
+        )
+    return usages
+
+
+def normalize_ast_attrs(raw_attrs: dict[object, object]) -> dict[str, str | bool]:
+    attrs: dict[str, str | bool] = {}
+    for raw_name, raw_value in raw_attrs.items():
+        name = normalize_attr_name(str(raw_name))
+        if not name:
+            continue
+        if raw_value is True:
+            attrs[name] = True
+        elif raw_value is False:
+            attrs[name] = "false"
+        elif raw_value is None:
+            attrs[name] = True
+        else:
+            attrs[name] = str(raw_value).strip()
+    return attrs
+
+
+def extract_component_usages_fallback(path: Path, aliases: dict[str, str]) -> list[ComponentUsage]:
     if path.suffix.lower() not in {".vue", ".svelte", ".html"}:
         return []
     try:
@@ -774,11 +868,11 @@ def context_matches_state(rule: Rule, context: str) -> bool:
 
 def scan_project(project: Path, rules: dict[str, list[Rule]], component_aliases: dict[str, str] | None = None) -> list[dict[str, object]]:
     declarations: list[Declaration] = []
-    usages: list[ComponentUsage] = []
     aliases = component_aliases or DEFAULT_COMPONENT_ALIASES
-    for path in iter_frontend_files(project):
+    frontend_files = list(iter_frontend_files(project))
+    for path in frontend_files:
         declarations.extend(extract_declarations(path))
-        usages.extend(extract_component_usages(path, aliases))
+    usages = extract_component_usages_from_files(frontend_files, aliases)
 
     comparable_rules = [
         rule
@@ -1016,6 +1110,8 @@ def require_prop_value(usage: ComponentUsage, rule: Rule, prop_name: str, expect
         if not report_missing:
             return None
         return component_violation(usage, rule, f"组件缺少 {prop_name} 配置", f"未找到 {prop_name}")
+    if is_dynamic_attr_value(actual):
+        return None
     if normalize_template_value(actual) != normalize_template_value(expected):
         return component_violation(usage, rule, f"组件 {prop_name} 配置不符合规范", str(actual))
     return None
@@ -1049,6 +1145,8 @@ def has_truthy_prop(usage: ComponentUsage, name: str) -> bool:
         return False
     if value is True:
         return True
+    if is_dynamic_attr_value(value):
+        return True
     return normalize_template_value(value) not in {"false", "0", "undefined", "null"}
 
 
@@ -1061,6 +1159,10 @@ def normalize_template_value(value: str | bool) -> str:
         return "true"
     normalized = str(value).strip().strip("'\"").lower()
     return re.sub(r"\s+", " ", normalized)
+
+
+def is_dynamic_attr_value(value: str | bool) -> bool:
+    return isinstance(value, str) and value.startswith(DYNAMIC_ATTR_PREFIX)
 
 
 def is_multiple_select(usage: ComponentUsage) -> bool:
