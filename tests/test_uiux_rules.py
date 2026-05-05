@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import subprocess
 import sys
 import tempfile
@@ -262,6 +264,97 @@ export function Page() {
         by_rule = {item["rule_id"]: item for item in violations}
         self.assertEqual(by_rule["CMP-009"]["actual"], "small")
         self.assertIn("CMP-011", by_rule)
+
+
+class ScanOutputTests(unittest.TestCase):
+    def test_scan_results_are_enriched_and_sorted_by_severity(self):
+        violations = uiux.enrich_violations(
+            [
+                {
+                    "rule_id": "FDN-006",
+                    "layer": "foundation",
+                    "component": "",
+                    "state": "default",
+                    "property_name": "spacing",
+                    "expected": "4px|8px",
+                    "actual": "3px",
+                    "path": "/tmp/a.vue",
+                    "line": 20,
+                    "reason": "spacing 应符合 FDN-006",
+                    "condition_if": "",
+                    "preferred_pattern": "使用标准间距令牌",
+                    "anti_pattern": "不要硬编码间距",
+                },
+                {
+                    "rule_id": "CMP-011",
+                    "layer": "component",
+                    "component": "select",
+                    "state": "default",
+                    "property_name": "component-config",
+                    "expected": "",
+                    "actual": "未找到 clearable",
+                    "path": "/tmp/a.vue",
+                    "line": 10,
+                    "reason": "选择器缺少 clearable 配置",
+                    "condition_if": "",
+                    "preferred_pattern": "启用 clearable",
+                    "anti_pattern": "不要忽略清除能力",
+                },
+            ]
+        )
+
+        sorted_violations = uiux.sort_violations(violations)
+
+        self.assertEqual(sorted_violations[0]["rule_id"], "CMP-011")
+        self.assertEqual(sorted_violations[0]["severity"], "high")
+        self.assertEqual(sorted_violations[1]["severity"], "low")
+        self.assertEqual(sorted_violations[0]["suggestion"], "启用 clearable")
+
+    def test_markdown_output_groups_same_rule_and_file(self):
+        violations = uiux.enrich_violations(
+            [
+                {
+                    "rule_id": "CMP-009",
+                    "layer": "component",
+                    "component": "input",
+                    "state": "default",
+                    "property_name": "size",
+                    "expected": "default",
+                    "actual": "small",
+                    "path": "/tmp/Page.vue",
+                    "line": 3,
+                    "reason": "组件 size 配置不符合规范",
+                    "condition_if": "",
+                    "preferred_pattern": "将 size 设置为 default",
+                    "anti_pattern": "不要使用 small",
+                },
+                {
+                    "rule_id": "CMP-009",
+                    "layer": "component",
+                    "component": "input",
+                    "state": "default",
+                    "property_name": "size",
+                    "expected": "default",
+                    "actual": "large",
+                    "path": "/tmp/Page.vue",
+                    "line": 8,
+                    "reason": "组件 size 配置不符合规范",
+                    "condition_if": "",
+                    "preferred_pattern": "将 size 设置为 default",
+                    "anti_pattern": "不要使用 small",
+                },
+            ]
+        )
+        buffer = io.StringIO()
+
+        with contextlib.redirect_stdout(buffer):
+            uiux.print_violations_markdown(uiux.sort_violations(violations), Path("/tmp/project"))
+
+        output = buffer.getvalue()
+        self.assertIn("合并展示：1 组", output)
+        self.assertIn("行号：3, 8", output)
+        self.assertIn("优化建议：将 size 设置为 default", output)
+        self.assertEqual(output.count("- CMP-009"), 1)
 
 
 if __name__ == "__main__":

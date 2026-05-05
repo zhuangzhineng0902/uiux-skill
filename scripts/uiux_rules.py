@@ -26,6 +26,13 @@ RULE_FILES = {
 COMPONENT_ALIASES_FILE = "component-aliases.csv"
 AST_COMPONENT_EXTRACTOR = Path(__file__).with_name("extract_ast_components.js")
 DYNAMIC_ATTR_PREFIX = "__dynamic__:"
+SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+SEVERITY_LABELS = {
+    "critical": "严重",
+    "high": "高",
+    "medium": "中",
+    "low": "低",
+}
 
 SCAN_EXTENSIONS = {
     ".css",
@@ -921,7 +928,7 @@ def scan_project(project: Path, rules: dict[str, list[Rule]], component_aliases:
 
     violations.extend(scan_component_usages(usages, rules["component"]))
     violations.extend(find_missing_component_states(declarations, rules["component"]))
-    return dedupe_violations(violations)
+    return sort_violations(enrich_violations(dedupe_violations(violations)))
 
 
 def is_comparable_rule(rule: Rule) -> bool:
@@ -1248,11 +1255,151 @@ def dedupe_violations(violations: list[dict[str, object]]) -> list[dict[str, obj
     return result
 
 
+def enrich_violations(violations: list[dict[str, object]]) -> list[dict[str, object]]:
+    enriched: list[dict[str, object]] = []
+    for item in violations:
+        copied = dict(item)
+        copied["severity"] = violation_severity(copied)
+        copied["severity_label"] = SEVERITY_LABELS[str(copied["severity"])]
+        copied["suggestion"] = violation_suggestion(copied)
+        enriched.append(copied)
+    return enriched
+
+
+def violation_severity(item: dict[str, object]) -> str:
+    rule_id = str(item.get("rule_id", ""))
+    layer = str(item.get("layer", ""))
+    prop = str(item.get("property_name", ""))
+    actual = str(item.get("actual", ""))
+    reason = str(item.get("reason", ""))
+
+    if rule_id == "CMP-state-coverage":
+        return "high"
+    if layer == "component":
+        if actual.startswith("未找到") or "缺少" in reason:
+            return "high"
+        return "medium"
+    if layer == "global":
+        if prop in {"z-index", "top", "right", "bottom", "left", "width", "max-width", "min-width"}:
+            return "high"
+        return "medium"
+    if prop in {"color", "background-color", "font-size", "line-height", "box-shadow", "border-color"}:
+        return "medium"
+    return "low"
+
+
+def violation_suggestion(item: dict[str, object]) -> str:
+    preferred = str(item.get("preferred_pattern", "")).strip()
+    if preferred:
+        return preferred
+    actual = str(item.get("actual", "")).strip()
+    expected = str(item.get("expected", "")).strip()
+    prop = str(item.get("property_name", "")).strip()
+    rule_id = str(item.get("rule_id", "")).strip()
+    if actual.startswith("未找到"):
+        missing = actual.removeprefix("未找到").strip()
+        return f"补充 {missing or prop} 配置，并按 {rule_id} 的规范要求校验。"
+    if expected:
+        return f"将 {prop} 调整为 {expected}，并优先使用设计系统令牌或组件库标准配置。"
+    return f"按 {rule_id} 检查该位置的 UI/UX 实现，并补齐规范要求。"
+
+
+def sort_violations(violations: list[dict[str, object]]) -> list[dict[str, object]]:
+    return sorted(
+        violations,
+        key=lambda item: (
+            SEVERITY_ORDER.get(str(item.get("severity", "low")), 99),
+            str(item.get("rule_id", "")),
+            str(item.get("path", "")),
+            int(item.get("line") or 0),
+            str(item.get("property_name", "")),
+        ),
+    )
+
+
+def group_violations_by_rule_file(violations: list[dict[str, object]]) -> list[dict[str, object]]:
+    groups: dict[tuple[str, str], dict[str, object]] = {}
+    for item in violations:
+        key = (str(item.get("rule_id", "")), str(item.get("path", "")))
+        if key not in groups:
+            groups[key] = {
+                "rule_id": item.get("rule_id", ""),
+                "path": item.get("path", ""),
+                "severity": item.get("severity", "low"),
+                "severity_label": item.get("severity_label", SEVERITY_LABELS["low"]),
+                "layer": item.get("layer", ""),
+                "component": item.get("component", ""),
+                "state": item.get("state", ""),
+                "property_name": item.get("property_name", ""),
+                "expected": item.get("expected", ""),
+                "reason": item.get("reason", ""),
+                "condition_if": item.get("condition_if", ""),
+                "anti_pattern": item.get("anti_pattern", ""),
+                "suggestion": item.get("suggestion", ""),
+                "items": [],
+            }
+        group = groups[key]
+        group["items"].append(item)
+        if SEVERITY_ORDER[str(item.get("severity", "low"))] < SEVERITY_ORDER[str(group["severity"])]:
+            group["severity"] = item.get("severity", "low")
+            group["severity_label"] = item.get("severity_label", SEVERITY_LABELS["low"])
+            group["reason"] = item.get("reason", "")
+            group["suggestion"] = item.get("suggestion", "")
+    return sorted(
+        groups.values(),
+        key=lambda group: (
+            SEVERITY_ORDER.get(str(group.get("severity", "low")), 99),
+            str(group.get("rule_id", "")),
+            str(group.get("path", "")),
+        ),
+    )
+
+
 def print_violations_markdown(violations: list[dict[str, object]], project: Path) -> None:
-    print(f"# UIUX 扫描报告\n\n工程：`{project}`\n\n违规数量：{len(violations)}\n")
+    groups = group_violations_by_rule_file(violations)
+    print(
+        f"# UIUX 扫描报告\n\n"
+        f"工程：`{project}`\n\n"
+        f"违规数量：{len(violations)}\n\n"
+        f"合并展示：{len(groups)} 组（同一规则同一文件已合并）\n"
+    )
     if not violations:
         print("未发现高置信度静态违规。")
         return
+    for severity in SEVERITY_ORDER:
+        bucket = [group for group in groups if group["severity"] == severity]
+        if not bucket:
+            continue
+        print(f"## {SEVERITY_LABELS[severity]}严重程度\n")
+        for group in bucket:
+            items = sorted(group["items"], key=lambda item: int(item.get("line") or 0))
+            lines = ", ".join(str(item.get("line", "")) for item in items)
+            actual_values = unique_texts(str(item.get("actual", "")) for item in items)
+            property_names = unique_texts(str(item.get("property_name", "")) for item in items)
+            expected_values_text = unique_texts(str(item.get("expected", "")) for item in items if item.get("expected"))
+            expected = "；".join(expected_values_text) if expected_values_text else "见规则要求"
+            actual = "；".join(actual_values)
+            props = "、".join(property_names)
+            print(
+                f"- {group['rule_id']} `{group['path']}`\n"
+                f"  - 行号：{lines}\n"
+                f"  - 属性：`{props}`；实际值：`{actual}`；期望值：`{expected}`\n"
+                f"  - 原因：{group['reason']}\n"
+                f"  - 优化建议：{group['suggestion']}\n"
+                f"  - 禁止/避免：{group['anti_pattern']}\n"
+            )
+
+
+def unique_texts(values: Iterable[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        if value and value not in result:
+            result.append(value)
+    return result
+
+
+def print_violations_markdown_legacy(violations: list[dict[str, object]], project: Path) -> None:
+    print(f"# UIUX 扫描报告\n\n工程：`{project}`\n\n违规数量：{len(violations)}\n")
     for item in violations:
         print(
             f"- {item['rule_id']} `{item['path']}:{item['line']}`\n"
