@@ -56,6 +56,23 @@ def component_rule(rule_id: str, component: str, property_name: str, default_val
     )
 
 
+def foundation_rule(rule_id: str, property_name: str, default_value: str = "", subject: str = ""):
+    return uiux.Rule(
+        {
+            "rule_id": rule_id,
+            "layer": "foundation",
+            "component": "",
+            "state": "default",
+            "property_name": property_name,
+            "default_value": default_value,
+            "subject": subject,
+            "condition_if": f"If foundation property = {property_name}",
+            "preferred_pattern": "test preferred",
+            "anti_pattern": "test anti",
+        }
+    )
+
+
 class CssParserTests(unittest.TestCase):
     def test_extracts_only_vue_style_declarations(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -267,6 +284,60 @@ export function Page() {
 
 
 class ScanOutputTests(unittest.TestCase):
+    @unittest.skipUnless(ast_dependencies_available(), "AST dependencies are not installed")
+    def test_scan_reports_tailwind_arbitrary_class_tokens(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "Page.vue").write_text(
+                """
+<template>
+  <section class="p-[18px] text-[#333] text-[13px] rounded-[3px] shadow-[0_1px_2px_rgba(0,0,0,0.2)]" />
+</template>
+""",
+                encoding="utf-8",
+            )
+            rules = {
+                "foundation": [
+                    foundation_rule("FDN-003", "color", "", "Tailwind arbitrary color"),
+                    foundation_rule("FDN-006", "spacing", "4px|8px", "Tailwind spacing"),
+                    foundation_rule("FDN-005", "typography-token", "12px|14px", "Tailwind typography"),
+                    foundation_rule("FDN-013", "border-radius", "2px|4px|8px", "radius"),
+                    foundation_rule("FDN-012", "box-shadow", "", "shadow"),
+                ],
+                "global": [],
+                "component": [],
+            }
+
+            report = uiux.scan_project_detailed(project, rules, {})
+
+        by_rule = {item["rule_id"]: item for item in report["violations"]}
+        self.assertEqual(by_rule["FDN-003"]["actual"], "class `text-[#333]`")
+        self.assertEqual(by_rule["FDN-006"]["actual"], "class `p-[18px]`")
+        self.assertEqual(by_rule["FDN-005"]["actual"], "class `text-[13px]`")
+        self.assertEqual(by_rule["FDN-013"]["actual"], "class `rounded-[3px]`")
+        self.assertEqual(by_rule["FDN-012"]["actual"], "class `shadow-[0_1px_2px_rgba(0,0,0,0.2)]`")
+        self.assertGreaterEqual(report["diagnostics"]["class_usages"], 1)
+
+    @unittest.skipUnless(ast_dependencies_available(), "AST dependencies are not installed")
+    def test_scan_diagnostics_are_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "Page.vue").write_text("<template><div class=\"p-[18px]\" /></template>", encoding="utf-8")
+            rules = {
+                "foundation": [foundation_rule("FDN-006", "spacing", "4px|8px", "Tailwind spacing")],
+                "global": [],
+                "component": [],
+            }
+
+            report = uiux.scan_project_detailed(project, rules, {})
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                uiux.print_violations_markdown(report["violations"], project, report["diagnostics"])
+
+        self.assertTrue(report["diagnostics"]["ast"]["ast_enabled"])
+        self.assertIn("## AST 诊断", buffer.getvalue())
+        self.assertIn("静态 class 用法", buffer.getvalue())
+
     def test_scan_results_are_enriched_and_sorted_by_severity(self):
         violations = uiux.enrich_violations(
             [

@@ -113,6 +113,8 @@ CSS 扫描优先使用 `tinycss2` 解析样式规则；组件扫描优先使用 
 
 若本机没有安装对应 Node 依赖，脚本会自动回退到轻量模板扫描，不中断基础扫描流程。
 
+AST 扫描还会抽取静态 `class` / `className`，用于检查 Tailwind 任意值类，例如 `text-[#333]`、`p-[18px]`、`text-[13px]`、`rounded-[3px]`、`shadow-[...]`。动态 class 会保守跳过，避免把运行时拼接误报为确定违规。
+
 ## 组件识别
 
 组件扫描会读取 `data/component-aliases.csv`，将公司内部 Vue/JSX 组件标签映射到规范组件类型，例如：
@@ -150,6 +152,17 @@ x-date-picker,datepicker,internal,公司日期选择器
 - 推荐做法和反模式
 
 Markdown 报告会按严重程度排序，并将同一规则在同一文件中的命中项合并展示，减少重复噪音；JSON 输出仍保留逐条违规，便于后续平台消费或二次聚合。
+
+Markdown 报告默认包含 AST 诊断信息，包括 AST 是否启用、解析文件数量、组件用法数量、静态 class 用法数量、失败文件数量和是否使用回退扫描。JSON 如需包含诊断信息，可使用：
+
+```bash
+python3 scripts/uiux_rules.py \
+  --rules-dir data \
+  --format json \
+  scan-project \
+  --project example \
+  --include-diagnostics
+```
 
 ## 边界与注意事项
 

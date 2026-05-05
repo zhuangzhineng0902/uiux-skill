@@ -229,18 +229,26 @@ function extractFile(file) {
 
 const input = readInput();
 const result = [];
+const diagnostics = {
+  ast_enabled: true,
+  files_total: (input.files || []).length,
+  parsed_files: 0,
+  failed_files: [],
+  fallback_used: false,
+};
 for (const file of input.files || []) {
+  const resolved = path.resolve(file);
   try {
-    result.push(...extractFile(path.resolve(file)));
+    result.push(...extractFile(resolved));
+    diagnostics.parsed_files += 1;
   } catch (error) {
-    result.push({
-      path: path.resolve(file),
-      line: 1,
-      tag: "",
-      attrs: {},
-      context: `AST parse failed: ${error.message}`,
-    });
+    diagnostics.failed_files.push({ path: resolved, reason: error.message });
   }
 }
+diagnostics.fallback_used = diagnostics.failed_files.length > 0;
 
-process.stdout.write(JSON.stringify(result));
+if (input.includeDiagnostics) {
+  process.stdout.write(JSON.stringify({ items: result, diagnostics }));
+} else {
+  process.stdout.write(JSON.stringify(result));
+}

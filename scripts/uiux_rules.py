@@ -264,6 +264,17 @@ class ComponentUsage:
     context: str
 
 
+@dataclass(frozen=True)
+class ClassUsage:
+    path: Path
+    line: int
+    tag: str
+    attr: str
+    value: str
+    tokens: tuple[str, ...]
+    context: str
+
+
 def resolve_rules_dir(value: str | None) -> Path:
     if value:
         return Path(value).expanduser().resolve()
@@ -407,9 +418,25 @@ def extract_component_usages_from_files(paths: Iterable[Path], aliases: dict[str
 
 
 def extract_component_usages_ast(paths: list[Path], aliases: dict[str, str]) -> list[ComponentUsage] | None:
-    if not AST_COMPONENT_EXTRACTOR.exists():
+    items, _diagnostics = run_ast_component_extractor(paths)
+    if items is None:
         return None
-    payload = {"files": [str(path) for path in paths]}
+    return component_usages_from_ast_items(items, aliases)
+
+
+def run_ast_component_extractor(paths: list[Path], include_diagnostics: bool = False) -> tuple[list[object] | None, dict[str, object]]:
+    diagnostics: dict[str, object] = {
+        "ast_enabled": False,
+        "files_total": len(paths),
+        "parsed_files": 0,
+        "failed_files": [],
+        "fallback_used": False,
+    }
+    if not AST_COMPONENT_EXTRACTOR.exists():
+        diagnostics["fallback_used"] = True
+        diagnostics["reason"] = "AST 抽取脚本不存在"
+        return None, diagnostics
+    payload = {"files": [str(path) for path in paths], "includeDiagnostics": include_diagnostics}
     try:
         completed = subprocess.run(
             ["node", str(AST_COMPONENT_EXTRACTOR)],
@@ -421,14 +448,36 @@ def extract_component_usages_ast(paths: list[Path], aliases: dict[str, str]) -> 
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return None
+        diagnostics["fallback_used"] = True
+        diagnostics["reason"] = "无法执行 Node AST 抽取器"
+        return None, diagnostics
     if completed.returncode != 0:
-        return None
+        diagnostics["fallback_used"] = True
+        diagnostics["reason"] = (completed.stderr or "Node AST 抽取器执行失败").strip()
+        return None, diagnostics
     try:
-        items = json.loads(completed.stdout or "[]")
+        payload_out = json.loads(completed.stdout or "[]")
     except json.JSONDecodeError:
-        return None
-    return component_usages_from_ast_items(items, aliases)
+        diagnostics["fallback_used"] = True
+        diagnostics["reason"] = "Node AST 抽取器输出不是合法 JSON"
+        return None, diagnostics
+    if isinstance(payload_out, dict):
+        raw_diagnostics = payload_out.get("diagnostics", {})
+        if isinstance(raw_diagnostics, dict):
+            diagnostics.update(raw_diagnostics)
+        items = payload_out.get("items", [])
+    else:
+        diagnostics.update(
+            {
+                "ast_enabled": True,
+                "files_total": len(paths),
+                "parsed_files": len(paths),
+                "failed_files": [],
+                "fallback_used": False,
+            }
+        )
+        items = payload_out
+    return (items if isinstance(items, list) else []), diagnostics
 
 
 def component_usages_from_ast_items(items: list[object], aliases: dict[str, str]) -> list[ComponentUsage]:
@@ -471,6 +520,37 @@ def normalize_ast_attrs(raw_attrs: dict[object, object]) -> dict[str, str | bool
         else:
             attrs[name] = str(raw_value).strip()
     return attrs
+
+
+def class_usages_from_ast_items(items: list[object]) -> list[ClassUsage]:
+    usages: list[ClassUsage] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        raw_attrs = item.get("attrs", {})
+        if not isinstance(raw_attrs, dict):
+            continue
+        for attr_name in ("class", "className"):
+            if attr_name not in raw_attrs:
+                continue
+            raw_value = raw_attrs[attr_name]
+            if not isinstance(raw_value, str) or is_dynamic_attr_value(raw_value):
+                continue
+            tokens = tuple(token for token in re.split(r"\s+", raw_value.strip()) if token)
+            if not tokens:
+                continue
+            usages.append(
+                ClassUsage(
+                    Path(str(item.get("path", ""))),
+                    int(item.get("line") or 1),
+                    str(item.get("tag", "")),
+                    attr_name,
+                    raw_value,
+                    tokens,
+                    re.sub(r"\s+", " ", str(item.get("context", ""))).strip(),
+                )
+            )
+    return usages
 
 
 def extract_component_usages_fallback(path: Path, aliases: dict[str, str]) -> list[ComponentUsage]:
@@ -875,12 +955,37 @@ def context_matches_state(rule: Rule, context: str) -> bool:
 
 
 def scan_project(project: Path, rules: dict[str, list[Rule]], component_aliases: dict[str, str] | None = None) -> list[dict[str, object]]:
+    return scan_project_detailed(project, rules, component_aliases)["violations"]
+
+
+def scan_project_detailed(
+    project: Path,
+    rules: dict[str, list[Rule]],
+    component_aliases: dict[str, str] | None = None,
+) -> dict[str, object]:
     declarations: list[Declaration] = []
     aliases = component_aliases or DEFAULT_COMPONENT_ALIASES
     frontend_files = list(iter_frontend_files(project))
     for path in frontend_files:
         declarations.extend(extract_declarations(path))
-    usages = extract_component_usages_from_files(frontend_files, aliases)
+
+    ast_candidates = [
+        path
+        for path in frontend_files
+        if path.suffix.lower() in {".vue", ".svelte", ".html", ".jsx", ".tsx", ".js", ".ts"}
+    ]
+    ast_items, ast_diagnostics = run_ast_component_extractor(ast_candidates, include_diagnostics=True)
+    if ast_items is None:
+        usages = extract_component_usages_from_files(frontend_files, aliases)
+        class_usages: list[ClassUsage] = []
+    else:
+        usages = component_usages_from_ast_items(ast_items, aliases)
+        class_usages = class_usages_from_ast_items(ast_items)
+        failed_files = ast_diagnostics.get("failed_files", [])
+        if isinstance(failed_files, list):
+            for failed in failed_files:
+                if isinstance(failed, dict) and failed.get("path"):
+                    usages.extend(extract_component_usages_fallback(Path(str(failed["path"])), aliases))
 
     comparable_rules = [
         rule
@@ -927,8 +1032,16 @@ def scan_project(project: Path, rules: dict[str, list[Rule]], component_aliases:
             )
 
     violations.extend(scan_component_usages(usages, rules["component"]))
+    violations.extend(scan_class_usages(class_usages, rules))
     violations.extend(find_missing_component_states(declarations, rules["component"]))
-    return sort_violations(enrich_violations(dedupe_violations(violations)))
+    return {
+        "violations": sort_violations(enrich_violations(dedupe_violations(violations))),
+        "diagnostics": {
+            "ast": ast_diagnostics,
+            "class_usages": len(class_usages),
+            "component_usages": len(usages),
+        },
+    }
 
 
 def is_comparable_rule(rule: Rule) -> bool:
@@ -1070,6 +1183,97 @@ def scan_component_usages(usages: list[ComponentUsage], component_rules: list[Ru
             if violation:
                 violations.append(violation)
     return violations
+
+
+def scan_class_usages(usages: list[ClassUsage], rules: dict[str, list[Rule]]) -> list[dict[str, object]]:
+    rules_by_id = {
+        rule.rule_id: rule
+        for bucket_rules in rules.values()
+        for rule in bucket_rules
+    }
+    violations: list[dict[str, object]] = []
+    for usage in usages:
+        for token in usage.tokens:
+            violation = evaluate_tailwind_token(usage, token, rules_by_id)
+            if violation:
+                violations.append(violation)
+    return violations
+
+
+def evaluate_tailwind_token(
+    usage: ClassUsage,
+    token: str,
+    rules_by_id: dict[str, Rule],
+) -> dict[str, object] | None:
+    normalized = normalize_tailwind_token(token)
+    checks = [
+        ("FDN-003", is_tailwind_arbitrary_color, "Tailwind class 使用任意颜色值"),
+        ("FDN-006", is_tailwind_arbitrary_spacing, "Tailwind class 使用任意间距值"),
+        ("FDN-005", is_tailwind_arbitrary_typography, "Tailwind class 使用任意字号或行高"),
+        ("FDN-013", is_tailwind_arbitrary_radius, "Tailwind class 使用任意圆角值"),
+        ("FDN-012", is_tailwind_arbitrary_shadow, "Tailwind class 使用任意阴影值"),
+    ]
+    for rule_id, predicate, reason in checks:
+        if not predicate(normalized):
+            continue
+        rule = rules_by_id.get(rule_id)
+        if not rule:
+            return None
+        return class_violation(usage, rule, reason, token)
+    return None
+
+
+def normalize_tailwind_token(token: str) -> str:
+    token = token.strip()
+    while ":" in token:
+        prefix, rest = token.split(":", 1)
+        if "[" in prefix and "]" in prefix:
+            break
+        token = rest
+    return token
+
+
+def is_tailwind_arbitrary_color(token: str) -> bool:
+    return bool(re.match(r"^(bg|text|border|from|via|to|ring|fill|stroke)-\[#(?:[0-9a-fA-F]{3,8})\]$", token))
+
+
+def is_tailwind_arbitrary_spacing(token: str) -> bool:
+    return bool(
+        re.match(
+            r"^-?(p|px|py|pt|pr|pb|pl|m|mx|my|mt|mr|mb|ml|gap|gap-x|gap-y|space-x|space-y|w|h|min-w|max-w|min-h|max-h)-\[-?\d+(\.\d+)?(px|rem|em)\]$",
+            token,
+        )
+    )
+
+
+def is_tailwind_arbitrary_typography(token: str) -> bool:
+    return bool(re.match(r"^(text|leading)-\[\d+(\.\d+)?(px|rem|em)\]$", token))
+
+
+def is_tailwind_arbitrary_radius(token: str) -> bool:
+    return bool(re.match(r"^rounded(?:-[trbl]{1,2})?-\[\d+(\.\d+)?(px|rem|em)\]$", token))
+
+
+def is_tailwind_arbitrary_shadow(token: str) -> bool:
+    return bool(re.match(r"^shadow-\[.+\]$", token))
+
+
+def class_violation(usage: ClassUsage, rule: Rule, reason: str, token: str) -> dict[str, object]:
+    return {
+        "rule_id": rule.rule_id,
+        "layer": rule.layer,
+        "component": rule.component,
+        "state": rule.state,
+        "property_name": rule.property_name,
+        "expected": rule.default_value,
+        "actual": f"class `{token}`",
+        "path": str(usage.path),
+        "line": usage.line,
+        "reason": f"{reason}（{usage.tag} 的 {usage.attr}）",
+        "condition_if": rule.row.get("condition_if", ""),
+        "preferred_pattern": rule.row.get("preferred_pattern", ""),
+        "anti_pattern": rule.row.get("anti_pattern", ""),
+    }
 
 
 def evaluate_component_rule(usage: ComponentUsage, rule: Rule) -> dict[str, object] | None:
@@ -1355,7 +1559,11 @@ def group_violations_by_rule_file(violations: list[dict[str, object]]) -> list[d
     )
 
 
-def print_violations_markdown(violations: list[dict[str, object]], project: Path) -> None:
+def print_violations_markdown(
+    violations: list[dict[str, object]],
+    project: Path,
+    diagnostics: dict[str, object] | None = None,
+) -> None:
     groups = group_violations_by_rule_file(violations)
     print(
         f"# UIUX 扫描报告\n\n"
@@ -1365,7 +1573,9 @@ def print_violations_markdown(violations: list[dict[str, object]], project: Path
     )
     if not violations:
         print("未发现高置信度静态违规。")
+        print_ast_diagnostics_markdown(diagnostics)
         return
+    print_ast_diagnostics_markdown(diagnostics)
     for severity in SEVERITY_ORDER:
         bucket = [group for group in groups if group["severity"] == severity]
         if not bucket:
@@ -1388,6 +1598,32 @@ def print_violations_markdown(violations: list[dict[str, object]], project: Path
                 f"  - 优化建议：{group['suggestion']}\n"
                 f"  - 禁止/避免：{group['anti_pattern']}\n"
             )
+
+
+def print_ast_diagnostics_markdown(diagnostics: dict[str, object] | None) -> None:
+    if not diagnostics:
+        return
+    ast = diagnostics.get("ast", {})
+    if not isinstance(ast, dict):
+        return
+    enabled = "是" if ast.get("ast_enabled") else "否"
+    fallback = "是" if ast.get("fallback_used") else "否"
+    failed_files = ast.get("failed_files", [])
+    failed_count = len(failed_files) if isinstance(failed_files, list) else 0
+    print("## AST 诊断\n")
+    print(
+        f"- AST 启用：{enabled}\n"
+        f"- AST 解析文件：{ast.get('parsed_files', 0)}/{ast.get('files_total', 0)}\n"
+        f"- 组件用法：{diagnostics.get('component_usages', 0)}；静态 class 用法：{diagnostics.get('class_usages', 0)}\n"
+        f"- 回退扫描：{fallback}；失败文件：{failed_count}\n"
+    )
+    if failed_count:
+        for item in failed_files[:5]:
+            if isinstance(item, dict):
+                print(f"  - `{item.get('path', '')}`：{item.get('reason', '')}")
+        if failed_count > 5:
+            print(f"  - 还有 {failed_count - 5} 个失败文件未展开")
+        print()
 
 
 def unique_texts(values: Iterable[str]) -> list[str]:
@@ -1420,6 +1656,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     scan_parser = subparsers.add_parser("scan-project", help="扫描前端工程中的高置信度 UIUX 违规。")
     scan_parser.add_argument("--project", required=True, help="前端工程路径。")
+    scan_parser.add_argument("--include-diagnostics", action="store_true", help="JSON 输出中包含 AST 诊断信息。")
 
     return parser
 
@@ -1441,11 +1678,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "scan-project":
         project = Path(args.project).expanduser().resolve()
-        violations = scan_project(project, rules, component_aliases)
+        report = scan_project_detailed(project, rules, component_aliases)
+        violations = report["violations"]
         if args.format == "json":
-            print(json.dumps(violations, ensure_ascii=False, indent=2))
+            payload = report if args.include_diagnostics else violations
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
         else:
-            print_violations_markdown(violations, project)
+            print_violations_markdown(violations, project, report.get("diagnostics", {}))
         return 0
 
     return 2
