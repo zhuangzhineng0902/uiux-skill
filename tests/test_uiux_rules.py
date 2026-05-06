@@ -73,6 +73,51 @@ def foundation_rule(rule_id: str, property_name: str, default_value: str = "", s
     )
 
 
+class RuleCsvShapeTests(unittest.TestCase):
+    def test_format_rule_matches_current_rule_csv_fields(self):
+        rule = uiux.Rule(
+            {
+                "rule_id": "FDN-001",
+                "prefix": "FDN",
+                "layer": "foundation",
+                "subject": "使用标准 Tailwind 颜色类",
+                "component": "",
+                "state": "default",
+                "property_name": "background-color",
+                "condition_if": "If color",
+                "then_clause": "Then semantic class",
+                "else_clause": "Else no raw hex",
+                "default_value": "",
+                "preferred_pattern": "Use semantic classes",
+                "anti_pattern": "No raw hex",
+                "evidence": "review",
+            }
+        )
+
+        formatted = uiux.format_rule(rule)
+
+        self.assertNotIn("page_type", formatted)
+        self.assertNotIn("source_ref", formatted)
+        self.assertEqual(
+            list(formatted),
+            [
+                "rule_id",
+                "layer",
+                "subject",
+                "component",
+                "state",
+                "property_name",
+                "condition_if",
+                "then_clause",
+                "else_clause",
+                "default_value",
+                "preferred_pattern",
+                "anti_pattern",
+                "evidence",
+            ],
+        )
+
+
 class CssParserTests(unittest.TestCase):
     def test_extracts_only_vue_style_declarations(self):
         with tempfile.TemporaryDirectory() as tmp:
